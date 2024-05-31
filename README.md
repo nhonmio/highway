@@ -55,6 +55,13 @@ the biggest gains are unlocked by designing algorithms and data structures for
 scalable vectors. Helpful techniques include batching, structure-of-array
 layouts, and aligned/padded allocations.
 
+We recommend these resources for getting started:
+
+-   [SIMD for C++ Developers](http://const.me/articles/simd/simd.pdf)
+-   [Algorithms for Modern Hardware](https://en.algorithmica.org/hpc/)
+-   [Optimizing software in C++](https://agner.org/optimize/optimizing_cpp.pdf)
+-   [Improving performance with SIMD intrinsics in three use cases](https://stackoverflow.blog/2020/07/08/improving-performance-with-simd-intrinsics-in-three-use-cases/)
+
 ## Examples
 
 Online demos using Compiler Explorer:
@@ -101,13 +108,14 @@ https://repology.org/project/highway-simd-library/versions .
 
 ### Targets
 
-Highway supports 22 targets, listed in alphabetical order of platform:
+Highway supports 24 targets, listed in alphabetical order of platform:
 
 -   Any: `EMU128`, `SCALAR`;
--   Arm: `NEON` (Armv7+), `SVE`, `SVE2`, `SVE_256`, `SVE2_128`;
+-   Armv7+: `NEON_WITHOUT_AES`, `NEON`, `NEON_BF16`, `SVE`, `SVE2`, `SVE_256`,
+    `SVE2_128`;
 -   IBM Z: `Z14`, `Z15`;
--   POWER: `PPC8` (v2.07), `PPC9` (v3.0), `PPC10` (v3.1B, not yet supported
-    due to compiler bugs, see #1207; also requires QEMU 7.2);
+-   POWER: `PPC8` (v2.07), `PPC9` (v3.0), `PPC10` (v3.1B, not yet supported due
+    to compiler bugs, see #1207; also requires QEMU 7.2);
 -   RISC-V: `RVV` (1.0);
 -   WebAssembly: `WASM`, `WASM_EMU256` (a 2x unrolled version of wasm128,
     enabled if `HWY_WANT_WASM2` is defined. This will remain supported until it
@@ -267,6 +275,11 @@ be prefixed with `HWY_ATTR`, OR reside between `HWY_BEFORE_NAMESPACE()` and
 `HWY_AFTER_NAMESPACE()`. Lambda functions currently require `HWY_ATTR` before
 their opening brace.
 
+Do not use namespace-scope nor `static` initializers for SIMD vectors because
+this can cause SIGILL when using runtime dispatch and the compiler chooses an
+initializer compiled for a target not supported by the current CPU. Instead,
+constants initialized via `Set` should generally be local (const) variables.
+
 The entry points into code using Highway differ slightly depending on whether
 they use static or dynamic dispatch. In both cases, we recommend that the
 top-level function receives one or more pointers to arrays, rather than
@@ -314,7 +327,7 @@ function templates) are usually inlined.
 
 ## Compiler flags
 
-Applications should be compiled with optimizations enabled - without inlining,
+Applications should be compiled with optimizations enabled. Without inlining
 SIMD code may slow down by factors of 10 to 100. For clang and GCC, `-O2` is
 generally sufficient.
 

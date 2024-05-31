@@ -27,6 +27,10 @@ namespace fake {
   namespace N_##TGT {                                                        \
     /* Function argument is just to ensure/demonstrate they are possible. */ \
     int64_t FakeFunction(int) { return HWY_##TGT; }                          \
+    template <typename T>                                                    \
+    int64_t FakeFunctionT(T) {                                               \
+      return HWY_##TGT;                                                      \
+    }                                                                        \
   }
 
 DECLARE_FUNCTION(AVX3_SPR)
@@ -42,6 +46,7 @@ DECLARE_FUNCTION(SVE2_128)
 DECLARE_FUNCTION(SVE_256)
 DECLARE_FUNCTION(SVE2)
 DECLARE_FUNCTION(SVE)
+DECLARE_FUNCTION(NEON_BF16)
 DECLARE_FUNCTION(NEON)
 DECLARE_FUNCTION(NEON_WITHOUT_AES)
 
@@ -62,6 +67,17 @@ DECLARE_FUNCTION(EMU128)
 
 HWY_EXPORT(FakeFunction);
 
+template <typename T>
+int64_t FakeFunctionDispatcher(T value) {
+  // Note that when calling templated code on arbitrary types, the dispatch
+  // table must be defined inside another template function.
+  HWY_EXPORT_T(FakeFunction1, FakeFunctionT<T>);
+  HWY_EXPORT_T(FakeFunction2, FakeFunctionT<bool>);
+  // Verify two EXPORT_T within a function are possible.
+  return hwy::AddWithWraparound(HWY_DYNAMIC_DISPATCH_T(FakeFunction1)(value),
+                                HWY_DYNAMIC_DISPATCH_T(FakeFunction2)(true));
+}
+
 void CallFunctionForTarget(int64_t target, int /*line*/) {
   if ((HWY_TARGETS & target) == 0) return;
   hwy::SetSupportedTargetsForTest(target);
@@ -72,15 +88,17 @@ void CallFunctionForTarget(int64_t target, int /*line*/) {
 
   HWY_ASSERT_EQ(target, HWY_DYNAMIC_DISPATCH(FakeFunction)(42));
 
+  // * 2 because we call two functions and add their target result together.
+  const int64_t target_times_2 =
+      static_cast<int64_t>(static_cast<uint64_t>(target) * 2ULL);
+  HWY_ASSERT_EQ(target_times_2, FakeFunctionDispatcher<float>(1.0f));
+  HWY_ASSERT_EQ(target_times_2, FakeFunctionDispatcher<double>(1.0));
+
   // Calling DeInit() will test that the initializer function
   // also calls the right function.
   hwy::GetChosenTarget().DeInit();
 
-#if HWY_DISPATCH_WORKAROUND
-  const int64_t expected = HWY_STATIC_TARGET;
-#else
   const int64_t expected = target;
-#endif
   HWY_ASSERT_EQ(expected, HWY_DYNAMIC_DISPATCH(FakeFunction)(42));
 
   // Second call uses the cached value from the previous call.
@@ -102,6 +120,7 @@ void CheckFakeFunction() {
   CallFunctionForTarget(HWY_SVE_256, __LINE__);
   CallFunctionForTarget(HWY_SVE2, __LINE__);
   CallFunctionForTarget(HWY_SVE, __LINE__);
+  CallFunctionForTarget(HWY_NEON_BF16, __LINE__);
   CallFunctionForTarget(HWY_NEON, __LINE__);
   CallFunctionForTarget(HWY_NEON_WITHOUT_AES, __LINE__);
 

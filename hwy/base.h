@@ -16,7 +16,7 @@
 #ifndef HIGHWAY_HWY_BASE_H_
 #define HIGHWAY_HWY_BASE_H_
 
-// For SIMD module implementations and their callers, target-independent.
+// Target-independent definitions.
 
 // IWYU pragma: begin_exports
 #include <stddef.h>
@@ -25,11 +25,17 @@
 #include "hwy/detect_compiler_arch.h"
 #include "hwy/highway_export.h"
 
-#if HWY_COMPILER_MSVC && defined(_MSVC_LANG) && _MSVC_LANG > __cplusplus
-#define HWY_CXX_LANG _MSVC_LANG
-#else
-#define HWY_CXX_LANG __cplusplus
-#endif
+// API version (https://semver.org/); keep in sync with CMakeLists.txt.
+#define HWY_MAJOR 1
+#define HWY_MINOR 2
+#define HWY_PATCH 0
+
+// True if the Highway version >= major.minor.0. Added in 1.2.0.
+#define HWY_VERSION_GE(major, minor) \
+  (HWY_MAJOR > (major) || (HWY_MAJOR == (major) && HWY_MINOR >= (minor)))
+// True if the Highway version < major.minor.0. Added in 1.2.0.
+#define HWY_VERSION_LT(major, minor) \
+  (HWY_MAJOR < (major) || (HWY_MAJOR == (major) && HWY_MINOR < (minor)))
 
 // "IWYU pragma: keep" does not work for these includes, so hide from the IDE.
 #if !HWY_IDE
@@ -47,14 +53,15 @@
 
 #endif  // !HWY_IDE
 
-#if !defined(HWY_NO_LIBCXX) && HWY_CXX_LANG > 201703L &&                    \
-    __cpp_impl_three_way_comparison >= 201907L && defined(__has_include) && \
-    !defined(HWY_DISABLE_CXX20_THREE_WAY_COMPARE)
-#if __has_include(<compare>)
+#ifndef HWY_HAVE_CXX20_THREE_WAY_COMPARE  // allow opt-out
+#if !defined(HWY_NO_LIBCXX) && defined(__cpp_impl_three_way_comparison) && \
+    __cpp_impl_three_way_comparison >= 201907L && HWY_HAS_INCLUDE(<compare>)
 #include <compare>
 #define HWY_HAVE_CXX20_THREE_WAY_COMPARE 1
+#else
+#define HWY_HAVE_CXX20_THREE_WAY_COMPARE 0
 #endif
-#endif
+#endif  // HWY_HAVE_CXX20_THREE_WAY_COMPARE
 
 // IWYU pragma: end_exports
 
@@ -72,6 +79,7 @@
 
 #include <intrin.h>
 
+#define HWY_FUNCTION __FUNCSIG__  // function name + template args
 #define HWY_RESTRICT __restrict
 #define HWY_INLINE __forceinline
 #define HWY_NOINLINE __declspec(noinline)
@@ -92,6 +100,7 @@
 
 #else
 
+#define HWY_FUNCTION __PRETTY_FUNCTION__  // function name + template args
 #define HWY_RESTRICT __restrict__
 // force inlining without optimization enabled creates very inefficient code
 // that can cause compiler timeout
@@ -139,9 +148,10 @@ namespace hwy {
 #define HWY_ASSUME_ALIGNED(ptr, align) (ptr) /* not supported */
 #endif
 
-// Special case to increases required alignment
+// Returns a pointer whose type is `type` (T*), while allowing the compiler to
+// assume that the untyped pointer `ptr` is aligned to a multiple of sizeof(T).
 #define HWY_RCAST_ALIGNED(type, ptr) \
-  reinterpret_cast<type>(HWY_ASSUME_ALIGNED((ptr), alignof(type)))
+  reinterpret_cast<type>(HWY_ASSUME_ALIGNED((ptr), alignof(RemovePtr<type>)))
 
 // Clang and GCC require attributes on each function into which SIMD intrinsics
 // are inlined. Support both per-function annotation (HWY_ATTR) for lambdas and
@@ -240,19 +250,29 @@ HWY_DLLEXPORT HWY_NORETURN void HWY_FORMAT(3, 4)
     }                                     \
   } while (0)
 
-#if HWY_HAS_FEATURE(memory_sanitizer) || defined(MEMORY_SANITIZER)
+#if HWY_HAS_FEATURE(memory_sanitizer) || defined(MEMORY_SANITIZER) || \
+    defined(__SANITIZE_MEMORY__)
 #define HWY_IS_MSAN 1
 #else
 #define HWY_IS_MSAN 0
 #endif
 
-#if HWY_HAS_FEATURE(address_sanitizer) || defined(ADDRESS_SANITIZER)
+#if HWY_HAS_FEATURE(address_sanitizer) || defined(ADDRESS_SANITIZER) || \
+    defined(__SANITIZE_ADDRESS__)
 #define HWY_IS_ASAN 1
 #else
 #define HWY_IS_ASAN 0
 #endif
 
-#if HWY_HAS_FEATURE(thread_sanitizer) || defined(THREAD_SANITIZER)
+#if HWY_HAS_FEATURE(hwaddress_sanitizer) || defined(HWADDRESS_SANITIZER) || \
+    defined(__SANITIZE_HWADDRESS__)
+#define HWY_IS_HWASAN 1
+#else
+#define HWY_IS_HWASAN 0
+#endif
+
+#if HWY_HAS_FEATURE(thread_sanitizer) || defined(THREAD_SANITIZER) || \
+    defined(__SANITIZE_THREAD__)
 #define HWY_IS_TSAN 1
 #else
 #define HWY_IS_TSAN 0
@@ -278,7 +298,8 @@ HWY_DLLEXPORT HWY_NORETURN void HWY_FORMAT(3, 4)
 // Clang does not define NDEBUG, but it and GCC define __OPTIMIZE__, and recent
 // MSVC defines NDEBUG (if not, could instead check _DEBUG).
 #if (!defined(__OPTIMIZE__) && !defined(NDEBUG)) || HWY_IS_ASAN || \
-    HWY_IS_MSAN || HWY_IS_TSAN || HWY_IS_UBSAN || defined(__clang_analyzer__)
+    HWY_IS_HWASAN || HWY_IS_MSAN || HWY_IS_TSAN || HWY_IS_UBSAN || \
+    defined(__clang_analyzer__)
 #define HWY_IS_DEBUG_BUILD 1
 #else
 #define HWY_IS_DEBUG_BUILD 0
@@ -292,26 +313,6 @@ HWY_DLLEXPORT HWY_NORETURN void HWY_FORMAT(3, 4)
   do {                         \
   } while (0)
 #endif
-#if __cpp_constexpr >= 201603L
-#define HWY_CXX17_CONSTEXPR constexpr
-#else
-#define HWY_CXX17_CONSTEXPR
-#endif
-#if __cpp_constexpr >= 201304L
-#define HWY_CXX14_CONSTEXPR constexpr
-#else
-#define HWY_CXX14_CONSTEXPR
-#endif
-
-#if HWY_CXX_LANG >= 201703L
-#define HWY_IF_CONSTEXPR if constexpr
-#else
-#define HWY_IF_CONSTEXPR if
-#endif
-
-#ifndef HWY_HAVE_CXX20_THREE_WAY_COMPARE
-#define HWY_HAVE_CXX20_THREE_WAY_COMPARE 0
-#endif
 
 //------------------------------------------------------------------------------
 // CopyBytes / ZeroBytes
@@ -321,9 +322,8 @@ HWY_DLLEXPORT HWY_NORETURN void HWY_FORMAT(3, 4)
 #pragma intrinsic(memset)
 #endif
 
-// The source/destination must not overlap/alias.
 template <size_t kBytes, typename From, typename To>
-HWY_API void CopyBytes(const From* from, To* to) {
+HWY_API void CopyBytes(const From* HWY_RESTRICT from, To* HWY_RESTRICT to) {
 #if HWY_COMPILER_MSVC
   memcpy(to, from, kBytes);
 #else
@@ -369,7 +369,7 @@ HWY_API void ZeroBytes(void* to, size_t num_bytes) {
 
 #if HWY_ARCH_X86
 static constexpr HWY_MAYBE_UNUSED size_t kMaxVectorSize = 64;  // AVX-512
-#elif HWY_ARCH_RVV && defined(__riscv_v_intrinsic) && \
+#elif HWY_ARCH_RISCV && defined(__riscv_v_intrinsic) && \
     __riscv_v_intrinsic >= 11000
 // Not actually an upper bound on the size.
 static constexpr HWY_MAYBE_UNUSED size_t kMaxVectorSize = 4096;
@@ -385,7 +385,7 @@ static constexpr HWY_MAYBE_UNUSED size_t kMaxVectorSize = 16;
 // exceed the stack size.
 #if HWY_ARCH_X86
 #define HWY_ALIGN_MAX alignas(64)
-#elif HWY_ARCH_RVV && defined(__riscv_v_intrinsic) && \
+#elif HWY_ARCH_RISCV && defined(__riscv_v_intrinsic) && \
     __riscv_v_intrinsic >= 11000
 #define HWY_ALIGN_MAX alignas(8)  // only elements need be aligned
 #else
@@ -575,6 +575,30 @@ using RemoveRef = typename RemoveRefT<T>::type;
 
 template <class T>
 using RemoveCvRef = RemoveConst<RemoveVolatile<RemoveRef<T>>>;
+
+template <class T>
+struct RemovePtrT {
+  using type = T;
+};
+template <class T>
+struct RemovePtrT<T*> {
+  using type = T;
+};
+template <class T>
+struct RemovePtrT<const T*> {
+  using type = T;
+};
+template <class T>
+struct RemovePtrT<volatile T*> {
+  using type = T;
+};
+template <class T>
+struct RemovePtrT<const volatile T*> {
+  using type = T;
+};
+
+template <class T>
+using RemovePtr = typename RemovePtrT<T>::type;
 
 // Insert into template/function arguments to enable this overload only for
 // vectors of exactly, at most (LE), or more than (GT) this many bytes.
@@ -1021,7 +1045,7 @@ HWY_API HWY_BITCASTSCALAR_CONSTEXPR To BitCastScalar(const From& val) {
 
 // RVV with f16 extension supports _Float16 and f16 vector ops. If set, implies
 // HWY_HAVE_FLOAT16.
-#if HWY_ARCH_RVV && defined(__riscv_zvfh) && HWY_COMPILER_CLANG >= 1600
+#if HWY_ARCH_RISCV && defined(__riscv_zvfh) && HWY_COMPILER_CLANG >= 1600
 #define HWY_RVV_HAVE_F16_VEC 1
 #else
 #define HWY_RVV_HAVE_F16_VEC 0
@@ -1369,8 +1393,22 @@ HWY_API HWY_F16_CONSTEXPR float16_t F16FromF32(float f32) {
   // 1[01] + 10 =  1[11]
   // 1[10] + 10 = C0[00]  (round up toward even with C=1 carry out)
   // 1[11] + 10 = C0[01]  (round up toward even with C=1 carry out)
-  const uint32_t odd_bit = (mantissa32 >> 13) & 1;
-  const uint32_t rounded = mantissa32 + odd_bit + 0xFFF;
+
+  // If |f32| >= 2^-24, f16_ulp_bit_idx is the index of the F32 mantissa bit
+  // that will be shifted down into the ULP bit of the rounded down F16 result
+
+  // The biased F32 exponent of 2^-14 (the smallest positive normal F16 value)
+  // is 113, and bit 13 of the F32 mantissa will be shifted down to into the ULP
+  // bit of the rounded down F16 result if |f32| >= 2^14
+
+  // If |f32| < 2^-24, f16_ulp_bit_idx is equal to 24 as there are 24 mantissa
+  // bits (including the implied 1 bit) in the mantissa of a normal F32 value
+  // and as we want to round up the mantissa if |f32| > 2^-25 && |f32| < 2^-24
+  const int32_t f16_ulp_bit_idx =
+      HWY_MIN(HWY_MAX(126 - static_cast<int32_t>(biased_exp32), 13), 24);
+  const uint32_t odd_bit = ((mantissa32 | 0x800000u) >> f16_ulp_bit_idx) & 1;
+  const uint32_t rounded =
+      mantissa32 + odd_bit + (uint32_t{1} << (f16_ulp_bit_idx - 1)) - 1u;
   const bool carry = rounded >= (1u << 23);
 
   const int32_t exp = static_cast<int32_t>(biased_exp32) - 127 + carry;

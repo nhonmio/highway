@@ -2552,6 +2552,29 @@ HWY_API svuint8_t DemoteTo(Simd<uint8_t, N, kPow2> dn, const svuint64_t v) {
   return TruncateTo(dn, vn);
 }
 
+// ------------------------------ Unsigned to signed demotions
+
+// Disable the default unsigned to signed DemoteTo/ReorderDemote2To
+// implementations in generic_ops-inl.h on SVE/SVE2 as the SVE/SVE2 targets have
+// target-specific implementations of the unsigned to signed DemoteTo and
+// ReorderDemote2To ops
+
+// NOTE: hwy::EnableIf<!hwy::IsSame<V, V>()>* = nullptr is used instead of
+// hwy::EnableIf<false>* = nullptr to avoid compiler errors since
+// !hwy::IsSame<V, V>() is always false and as !hwy::IsSame<V, V>() will cause
+// SFINAE to occur instead of a hard error due to a dependency on the V template
+// argument
+#undef HWY_IF_U2I_DEMOTE_FROM_LANE_SIZE_V
+#define HWY_IF_U2I_DEMOTE_FROM_LANE_SIZE_V(V) \
+  hwy::EnableIf<!hwy::IsSame<V, V>()>* = nullptr
+
+template <class D, class V, HWY_IF_SIGNED_D(D), HWY_IF_UNSIGNED_V(V),
+          HWY_IF_T_SIZE_LE_D(D, sizeof(TFromV<V>) - 1)>
+HWY_API VFromD<D> DemoteTo(D dn, V v) {
+  const RebindToUnsigned<D> dn_u;
+  return BitCast(dn, TruncateTo(dn_u, detail::SaturateU<TFromD<D>>(v)));
+}
+
 // ------------------------------ ConcatEven/ConcatOdd
 
 // WARNING: the upper half of these needs fixing up (uzp1/uzp2 use the
@@ -2624,6 +2647,18 @@ HWY_API VFromD<D> ConcatEven(D d, VFromD<D> hi, VFromD<D> lo) {
   const VFromD<D> lo_odd = detail::ConcatEvenFull(lo, lo);
   return detail::Splice(hi_odd, lo_odd, FirstN(d, Lanes(d) / 2));
 }
+
+// ------------------------------ PromoteEvenTo/PromoteOddTo
+
+// Signed to signed PromoteEvenTo: 1 instruction instead of 2 in generic-inl.h.
+// Might as well also enable unsigned to unsigned, though it is just an And.
+namespace detail {
+HWY_SVE_FOREACH_UI16(HWY_SVE_RETV_ARGPV, NativePromoteEvenTo, extb)
+HWY_SVE_FOREACH_UI32(HWY_SVE_RETV_ARGPV, NativePromoteEvenTo, exth)
+HWY_SVE_FOREACH_UI64(HWY_SVE_RETV_ARGPV, NativePromoteEvenTo, extw)
+}  // namespace detail
+
+#include "hwy/ops/inside-inl.h"
 
 // ------------------------------ DemoteTo F
 
@@ -2730,32 +2765,31 @@ HWY_API svfloat32_t DemoteTo(Simd<float, N, kPow2> d, const svuint64_t v) {
 // ------------------------------ ConvertTo F
 
 #define HWY_SVE_CONVERT(BASE, CHAR, BITS, HALF, NAME, OP)                      \
-  /* signed integers */                                                        \
+  /* Float from signed */                                                      \
   template <size_t N, int kPow2>                                               \
   HWY_API HWY_SVE_V(BASE, BITS)                                                \
       NAME(HWY_SVE_D(BASE, BITS, N, kPow2) /* d */, HWY_SVE_V(int, BITS) v) {  \
     return sv##OP##_##CHAR##BITS##_s##BITS##_x(HWY_SVE_PTRUE(BITS), v);        \
   }                                                                            \
-  /* unsigned integers */                                                      \
+  /* Float from unsigned */                                                    \
   template <size_t N, int kPow2>                                               \
   HWY_API HWY_SVE_V(BASE, BITS)                                                \
       NAME(HWY_SVE_D(BASE, BITS, N, kPow2) /* d */, HWY_SVE_V(uint, BITS) v) { \
     return sv##OP##_##CHAR##BITS##_u##BITS##_x(HWY_SVE_PTRUE(BITS), v);        \
   }                                                                            \
-  /* Truncates (rounds toward zero). */                                        \
+  /* Signed from float, rounding toward zero */                                \
   template <size_t N, int kPow2>                                               \
   HWY_API HWY_SVE_V(int, BITS)                                                 \
       NAME(HWY_SVE_D(int, BITS, N, kPow2) /* d */, HWY_SVE_V(BASE, BITS) v) {  \
     return sv##OP##_s##BITS##_##CHAR##BITS##_x(HWY_SVE_PTRUE(BITS), v);        \
   }                                                                            \
-  /* Truncates to unsigned (rounds toward zero). */                            \
+  /* Unsigned from float, rounding toward zero */                              \
   template <size_t N, int kPow2>                                               \
   HWY_API HWY_SVE_V(uint, BITS)                                                \
       NAME(HWY_SVE_D(uint, BITS, N, kPow2) /* d */, HWY_SVE_V(BASE, BITS) v) { \
     return sv##OP##_u##BITS##_##CHAR##BITS##_x(HWY_SVE_PTRUE(BITS), v);        \
   }
 
-// API only requires f32 but we provide f64 for use by Iota.
 HWY_SVE_FOREACH_F(HWY_SVE_CONVERT, ConvertTo, cvt)
 #undef HWY_SVE_CONVERT
 
@@ -3234,13 +3268,15 @@ HWY_API TFromV<V> ExtractLane(V v, size_t i) {
 }
 
 // ------------------------------ InsertLane (IfThenElse)
-template <class V>
-HWY_API V InsertLane(const V v, size_t i, TFromV<V> t) {
+template <class V, typename T>
+HWY_API V InsertLane(const V v, size_t i, T t) {
+  static_assert(sizeof(TFromV<V>) == sizeof(T), "Lane size mismatch");
   const DFromV<V> d;
   const RebindToSigned<decltype(d)> di;
   using TI = TFromD<decltype(di)>;
   const svbool_t is_i = detail::EqN(Iota(di, 0), static_cast<TI>(i));
-  return IfThenElse(RebindMask(d, is_i), Set(d, t), v);
+  return IfThenElse(RebindMask(d, is_i),
+                    Set(d, hwy::ConvertScalarTo<TFromV<V>>(t)), v);
 }
 
 // ------------------------------ DupEven
@@ -4206,6 +4242,95 @@ HWY_API VFromD<DW> ZipUpper(DW dw, V a, V b) {
 
 // ================================================== Ops with dependencies
 
+// ------------------------------ AddSub (Reverse2)
+
+// NOTE: svcadd_f*_x(HWY_SVE_PTRUE(BITS), a, b, 90) computes a[i] - b[i + 1] in
+// the even lanes and a[i] + b[i - 1] in the odd lanes.
+
+#define HWY_SVE_ADDSUB_F(BASE, CHAR, BITS, HALF, NAME, OP)                   \
+  HWY_API HWY_SVE_V(BASE, BITS)                                              \
+      NAME(HWY_SVE_V(BASE, BITS) a, HWY_SVE_V(BASE, BITS) b) {               \
+    const DFromV<decltype(b)> d;                                             \
+    return sv##OP##_##CHAR##BITS##_x(HWY_SVE_PTRUE(BITS), a, Reverse2(d, b), \
+                                     90);                                    \
+  }
+
+HWY_SVE_FOREACH_F(HWY_SVE_ADDSUB_F, AddSub, cadd)
+
+#undef HWY_SVE_ADDSUB_F
+
+// NOTE: svcadd_s*(a, b, 90) and svcadd_u*(a, b, 90) compute a[i] - b[i + 1] in
+// the even lanes and a[i] + b[i - 1] in the odd lanes.
+
+#if HWY_SVE_HAVE_2
+#define HWY_SVE_ADDSUB_UI(BASE, CHAR, BITS, HALF, NAME, OP)    \
+  HWY_API HWY_SVE_V(BASE, BITS)                                \
+      NAME(HWY_SVE_V(BASE, BITS) a, HWY_SVE_V(BASE, BITS) b) { \
+    const DFromV<decltype(b)> d;                               \
+    return sv##OP##_##CHAR##BITS(a, Reverse2(d, b), 90);       \
+  }
+
+HWY_SVE_FOREACH_UI(HWY_SVE_ADDSUB_UI, AddSub, cadd)
+
+#undef HWY_SVE_ADDSUB_UI
+
+// Disable the default implementation of AddSub in generic_ops-inl.h on SVE2
+#undef HWY_IF_ADDSUB_V
+#define HWY_IF_ADDSUB_V(V)         \
+  HWY_IF_LANES_GT_D(DFromV<V>, 1), \
+      hwy::EnableIf<!hwy::IsSame<V, V>()>* = nullptr
+
+#else  // !HWY_SVE_HAVE_2
+
+// Disable the default implementation of AddSub in generic_ops-inl.h for
+// floating-point vectors on SVE, but enable the default implementation of
+// AddSub in generic_ops-inl.h for integer vectors on SVE that do not support
+// SVE2
+#undef HWY_IF_ADDSUB_V
+#define HWY_IF_ADDSUB_V(V) \
+  HWY_IF_LANES_GT_D(DFromV<V>, 1), HWY_IF_NOT_FLOAT_NOR_SPECIAL_V(V)
+
+#endif  // HWY_SVE_HAVE_2
+
+// ------------------------------ MulAddSub (AddSub)
+
+template <class V, HWY_IF_LANES_GT_D(DFromV<V>, 1), HWY_IF_FLOAT_V(V)>
+HWY_API V MulAddSub(V mul, V x, V sub_or_add) {
+  using T = TFromV<V>;
+
+  const DFromV<V> d;
+  const T neg_zero = ConvertScalarTo<T>(-0.0f);
+
+  return MulAdd(mul, x, AddSub(Set(d, neg_zero), sub_or_add));
+}
+
+#if HWY_SVE_HAVE_2
+
+// Disable the default implementation of MulAddSub in generic_ops-inl.h on SVE2
+#undef HWY_IF_MULADDSUB_V
+#define HWY_IF_MULADDSUB_V(V)      \
+  HWY_IF_LANES_GT_D(DFromV<V>, 1), \
+      hwy::EnableIf<!hwy::IsSame<V, V>()>* = nullptr
+
+template <class V, HWY_IF_LANES_GT_D(DFromV<V>, 1),
+          HWY_IF_NOT_FLOAT_NOR_SPECIAL_V(V)>
+HWY_API V MulAddSub(V mul, V x, V sub_or_add) {
+  const DFromV<V> d;
+  return MulAdd(mul, x, AddSub(Zero(d), sub_or_add));
+}
+
+#else  // !HWY_SVE_HAVE_2
+
+// Disable the default implementation of MulAddSub in generic_ops-inl.h for
+// floating-point vectors on SVE, but enable the default implementation of
+// AddSub in generic_ops-inl.h for integer vectors on SVE targets that do not
+// support SVE2
+#undef HWY_IF_MULADDSUB_V
+#define HWY_IF_MULADDSUB_V(V) \
+  HWY_IF_LANES_GT_D(DFromV<V>, 1), HWY_IF_NOT_FLOAT_NOR_SPECIAL_V(V)
+
+#endif  // HWY_SVE_HAVE_2
+
 // ------------------------------ PromoteTo bfloat16 (ZipLower)
 template <size_t N, int kPow2>
 HWY_API svfloat32_t PromoteTo(Simd<float32_t, N, kPow2> df32, VBF16 v) {
@@ -4484,6 +4609,14 @@ HWY_API svuint32_t ReorderDemote2To(Simd<uint32_t, N, kPow2> d32, svuint64_t a,
   const svuint32_t b32 = BitCast(d32, detail::SaturateU<uint32_t>(b));
   return detail::InterleaveEven(a32, b32);
 #endif
+}
+
+template <class D, class V, HWY_IF_SIGNED_D(D), HWY_IF_UNSIGNED_V(V),
+          HWY_IF_T_SIZE_D(D, sizeof(TFromV<V>) / 2)>
+HWY_API VFromD<D> ReorderDemote2To(D dn, V a, V b) {
+  const auto clamped_a = BitCast(dn, detail::SaturateU<TFromD<D>>(a));
+  const auto clamped_b = BitCast(dn, detail::SaturateU<TFromD<D>>(b));
+  return detail::InterleaveEven(clamped_a, clamped_b);
 }
 
 template <class D, class V, HWY_IF_NOT_FLOAT_NOR_SPECIAL(TFromD<D>),
@@ -5608,23 +5741,14 @@ HWY_API svuint64_t MulOdd(const svuint64_t a, const svuint64_t b) {
 // ------------------------------ WidenMulPairwiseAdd
 
 template <size_t N, int kPow2>
-HWY_API svfloat32_t WidenMulPairwiseAdd(Simd<float, N, kPow2> df32, VBF16 a,
+HWY_API svfloat32_t WidenMulPairwiseAdd(Simd<float, N, kPow2> df, VBF16 a,
                                         VBF16 b) {
 #if HWY_SVE_HAVE_F32_TO_BF16C
-  const svfloat32_t even = svbfmlalb_f32(Zero(df32), a, b);
+  const svfloat32_t even = svbfmlalb_f32(Zero(df), a, b);
   return svbfmlalt_f32(even, a, b);
 #else
-  const RebindToUnsigned<decltype(df32)> du32;
-  // Using shift/and instead of Zip leads to the odd/even order that
-  // RearrangeToOddPlusEven prefers.
-  using VU32 = VFromD<decltype(du32)>;
-  const VU32 odd = Set(du32, 0xFFFF0000u);
-  const VU32 ae = ShiftLeft<16>(BitCast(du32, a));
-  const VU32 ao = And(BitCast(du32, a), odd);
-  const VU32 be = ShiftLeft<16>(BitCast(du32, b));
-  const VU32 bo = And(BitCast(du32, b), odd);
-  return MulAdd(BitCast(df32, ae), BitCast(df32, be),
-                Mul(BitCast(df32, ao), BitCast(df32, bo)));
+  return MulAdd(PromoteEvenTo(df, a), PromoteEvenTo(df, b),
+                Mul(PromoteOddTo(df, a), PromoteOddTo(df, b)));
 #endif  // HWY_SVE_HAVE_BF16_FEATURE
 }
 
@@ -5635,14 +5759,8 @@ HWY_API svint32_t WidenMulPairwiseAdd(Simd<int32_t, N, kPow2> d32, svint16_t a,
   (void)d32;
   return svmlalt_s32(svmullb_s32(a, b), a, b);
 #else
-  const svbool_t pg = detail::PTrue(d32);
-  // Shifting extracts the odd lanes as RearrangeToOddPlusEven prefers.
-  // Fortunately SVE has sign-extension for the even lanes.
-  const svint32_t ae = svexth_s32_x(pg, BitCast(d32, a));
-  const svint32_t be = svexth_s32_x(pg, BitCast(d32, b));
-  const svint32_t ao = ShiftRight<16>(BitCast(d32, a));
-  const svint32_t bo = ShiftRight<16>(BitCast(d32, b));
-  return svmla_s32_x(pg, svmul_s32_x(pg, ao, bo), ae, be);
+  return MulAdd(PromoteEvenTo(d32, a), PromoteEvenTo(d32, b),
+                Mul(PromoteOddTo(d32, a), PromoteOddTo(d32, b)));
 #endif
 }
 
@@ -5653,42 +5771,58 @@ HWY_API svuint32_t WidenMulPairwiseAdd(Simd<uint32_t, N, kPow2> d32,
   (void)d32;
   return svmlalt_u32(svmullb_u32(a, b), a, b);
 #else
-  const svbool_t pg = detail::PTrue(d32);
-  // Shifting extracts the odd lanes as RearrangeToOddPlusEven prefers.
-  // Fortunately SVE has sign-extension for the even lanes.
-  const svuint32_t ae = svexth_u32_x(pg, BitCast(d32, a));
-  const svuint32_t be = svexth_u32_x(pg, BitCast(d32, b));
-  const svuint32_t ao = ShiftRight<16>(BitCast(d32, a));
-  const svuint32_t bo = ShiftRight<16>(BitCast(d32, b));
-  return svmla_u32_x(pg, svmul_u32_x(pg, ao, bo), ae, be);
+  return MulAdd(PromoteEvenTo(d32, a), PromoteEvenTo(d32, b),
+                Mul(PromoteOddTo(d32, a), PromoteOddTo(d32, b)));
 #endif
 }
 
+// ------------------------------ SatWidenMulAccumFixedPoint
+
+#if HWY_SVE_HAVE_2
+
+#ifdef HWY_NATIVE_I16_SATWIDENMULACCUMFIXEDPOINT
+#undef HWY_NATIVE_I16_SATWIDENMULACCUMFIXEDPOINT
+#else
+#define HWY_NATIVE_I16_SATWIDENMULACCUMFIXEDPOINT
+#endif
+
+template <class DI32, HWY_IF_I32_D(DI32)>
+HWY_API VFromD<DI32> SatWidenMulAccumFixedPoint(DI32 /*di32*/,
+                                                VFromD<Rebind<int16_t, DI32>> a,
+                                                VFromD<Rebind<int16_t, DI32>> b,
+                                                VFromD<DI32> sum) {
+  return svqdmlalb_s32(sum, detail::ZipLowerSame(a, a),
+                       detail::ZipLowerSame(b, b));
+}
+
+#endif  // HWY_SVE_HAVE_2
+
 // ------------------------------ ReorderWidenMulAccumulate (MulAdd, ZipLower)
 
-template <size_t N, int kPow2>
-HWY_API svfloat32_t ReorderWidenMulAccumulate(Simd<float, N, kPow2> df32,
-                                              VBF16 a, VBF16 b,
-                                              const svfloat32_t sum0,
-                                              svfloat32_t& sum1) {
 #if HWY_SVE_HAVE_BF16_FEATURE
-  (void)df32;
-  sum1 = svbfmlalt_f32(sum1, a, b);
-  return svbfmlalb_f32(sum0, a, b);
+
+// NOTE: we currently do not use SVE BFDOT for bf16 ReorderWidenMulAccumulate
+// because, apparently unlike NEON, it uses round to odd unless the additional
+// FEAT_EBF16 feature is available and enabled.
+#ifdef HWY_NATIVE_MUL_EVEN_BF16
+#undef HWY_NATIVE_MUL_EVEN_BF16
 #else
-  const RebindToUnsigned<decltype(df32)> du32;
-  // Using shift/and instead of Zip leads to the odd/even order that
-  // RearrangeToOddPlusEven prefers.
-  using VU32 = VFromD<decltype(du32)>;
-  const VU32 odd = Set(du32, 0xFFFF0000u);
-  const VU32 ae = ShiftLeft<16>(BitCast(du32, a));
-  const VU32 ao = And(BitCast(du32, a), odd);
-  const VU32 be = ShiftLeft<16>(BitCast(du32, b));
-  const VU32 bo = And(BitCast(du32, b), odd);
-  sum1 = MulAdd(BitCast(df32, ao), BitCast(df32, bo), sum1);
-  return MulAdd(BitCast(df32, ae), BitCast(df32, be), sum0);
-#endif  // HWY_SVE_HAVE_BF16_FEATURE
+#define HWY_NATIVE_MUL_EVEN_BF16
+#endif
+
+template <size_t N, int kPow2>
+HWY_API svfloat32_t MulEvenAdd(Simd<float, N, kPow2> /* d */, VBF16 a, VBF16 b,
+                               const svfloat32_t c) {
+  return svbfmlalb_f32(c, a, b);
 }
+
+template <size_t N, int kPow2>
+HWY_API svfloat32_t MulOddAdd(Simd<float, N, kPow2> /* d */, VBF16 a, VBF16 b,
+                              const svfloat32_t c) {
+  return svbfmlalt_f32(c, a, b);
+}
+
+#endif  // HWY_SVE_HAVE_BF16_FEATURE
 
 template <size_t N, int kPow2>
 HWY_API svint32_t ReorderWidenMulAccumulate(Simd<int32_t, N, kPow2> d32,
@@ -5700,15 +5834,10 @@ HWY_API svint32_t ReorderWidenMulAccumulate(Simd<int32_t, N, kPow2> d32,
   sum1 = svmlalt_s32(sum1, a, b);
   return svmlalb_s32(sum0, a, b);
 #else
-  const svbool_t pg = detail::PTrue(d32);
-  // Shifting extracts the odd lanes as RearrangeToOddPlusEven prefers.
-  // Fortunately SVE has sign-extension for the even lanes.
-  const svint32_t ae = svexth_s32_x(pg, BitCast(d32, a));
-  const svint32_t be = svexth_s32_x(pg, BitCast(d32, b));
-  const svint32_t ao = ShiftRight<16>(BitCast(d32, a));
-  const svint32_t bo = ShiftRight<16>(BitCast(d32, b));
-  sum1 = svmla_s32_x(pg, sum1, ao, bo);
-  return svmla_s32_x(pg, sum0, ae, be);
+  // Lane order within sum0/1 is undefined, hence we can avoid the
+  // longer-latency lane-crossing PromoteTo by using PromoteEvenTo.
+  sum1 = MulAdd(PromoteOddTo(d32, a), PromoteOddTo(d32, b), sum1);
+  return MulAdd(PromoteEvenTo(d32, a), PromoteEvenTo(d32, b), sum0);
 #endif
 }
 
@@ -5722,15 +5851,10 @@ HWY_API svuint32_t ReorderWidenMulAccumulate(Simd<uint32_t, N, kPow2> d32,
   sum1 = svmlalt_u32(sum1, a, b);
   return svmlalb_u32(sum0, a, b);
 #else
-  const svbool_t pg = detail::PTrue(d32);
-  // Shifting extracts the odd lanes as RearrangeToOddPlusEven prefers.
-  // Fortunately SVE has sign-extension for the even lanes.
-  const svuint32_t ae = svexth_u32_x(pg, BitCast(d32, a));
-  const svuint32_t be = svexth_u32_x(pg, BitCast(d32, b));
-  const svuint32_t ao = ShiftRight<16>(BitCast(d32, a));
-  const svuint32_t bo = ShiftRight<16>(BitCast(d32, b));
-  sum1 = svmla_u32_x(pg, sum1, ao, bo);
-  return svmla_u32_x(pg, sum0, ae, be);
+  // Lane order within sum0/1 is undefined, hence we can avoid the
+  // longer-latency lane-crossing PromoteTo by using PromoteEvenTo.
+  sum1 = MulAdd(PromoteOddTo(d32, a), PromoteOddTo(d32, b), sum1);
+  return MulAdd(PromoteEvenTo(d32, a), PromoteEvenTo(d32, b), sum0);
 #endif
 }
 
